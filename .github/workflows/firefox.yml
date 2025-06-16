@@ -70,10 +70,10 @@ jobs:
           cache: 'yarn'
 
       - name: Setup NPM Token
-        if: ${{ secrets.NPM_AUTH_TOKEN }}
         uses: heisenberg-2077/use-npm-token-action@v1
         with:
           token: '${{ secrets.NPM_AUTH_TOKEN }}'
+        continue-on-error: true
 
       - name: Install dependencies
         run: |
@@ -210,21 +210,19 @@ jobs:
             dist-mv2/
           retention-days: 30
 
-      - name: Check AMO credentials
-        id: check-amo
+      - name: Upload to Firefox Add-ons (AMO)
         if: ${{ inputs.upload_to_amo == true }}
         run: |
-          if [ -n "${{ secrets.AMO_JWT_ISSUER }}" ] && [ -n "${{ secrets.AMO_JWT_SECRET }}" ]; then
-            echo "amo_ready=true" >> $GITHUB_OUTPUT
-          else
-            echo "amo_ready=false" >> $GITHUB_OUTPUT
-            echo "❌ AMO credentials not configured"
+          echo "🚀 Checking AMO credentials and uploading..."
+          
+          # Проверяем наличие учетных данных
+          if [ -z "${{ secrets.AMO_JWT_ISSUER }}" ] || [ -z "${{ secrets.AMO_JWT_SECRET }}" ]; then
+            echo "❌ AMO credentials not configured. Skipping upload."
+            echo "To upload to AMO, set AMO_JWT_ISSUER and AMO_JWT_SECRET secrets."
+            exit 0
           fi
-
-      - name: Upload to Firefox Add-ons (AMO)
-        if: ${{ steps.check-amo.outputs.amo_ready == 'true' }}
-        run: |
-          echo "🚀 Uploading to Firefox Add-ons..."
+          
+          echo "✅ AMO credentials found. Proceeding with upload..."
           
           # Устанавливаем web-ext
           npm install -g web-ext
@@ -236,6 +234,8 @@ jobs:
             --api-secret="${{ secrets.AMO_JWT_SECRET }}" \
             --channel=unlisted
           cd ..
+          
+          echo "✅ Upload to AMO completed!"
 
       - name: Create GitHub Release
         if: ${{ inputs.create_release == true && github.event_name == 'workflow_dispatch' }}
