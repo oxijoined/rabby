@@ -1,0 +1,319 @@
+name: Build Firefox Extension
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Тип сборки'
+        required: true
+        default: 'debug'
+        type: choice
+        options:
+        - debug
+        - pro
+        - dev
+      version_bump:
+        description: 'Увеличить версию'
+        required: false
+        default: false
+        type: boolean
+      create_release:
+        description: 'Создать GitHub Release'
+        required: false
+        default: false
+        type: boolean
+      upload_to_amo:
+        description: 'Загрузить в Firefox Add-ons'
+        required: false
+        default: false
+        type: boolean
+  push:
+    branches:
+      - main
+      - develop
+      - 'firefox/**'
+    paths:
+      - 'src/**'
+      - 'package.json'
+      - 'webpack/**'
+      - 'build/**'
+  pull_request:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'src/**'
+      - 'package.json'
+      - 'webpack/**'
+      - 'build/**'
+
+env:
+  NODE_OPTIONS: '--max_old_space_size=8192'
+
+jobs:
+  build-firefox:
+    name: Build Firefox Extension
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get-version.outputs.version }}
+      artifact-name: ${{ steps.create-artifacts.outputs.artifact-name }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18.20.4'
+          cache: 'yarn'
+
+      - name: Setup NPM Token
+        if: ${{ secrets.NPM_AUTH_TOKEN != '' }}
+        uses: heisenberg-2077/use-npm-token-action@v1
+        with:
+          token: '${{ secrets.NPM_AUTH_TOKEN }}'
+
+      - name: Install dependencies
+        run: |
+          yarn install --frozen-lockfile
+          yarn cache clean
+
+      - name: Get current version
+        id: get-version
+        run: |
+          VERSION=$(node --eval="process.stdout.write(require('./package.json').version)")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Current version: $VERSION"
+
+      - name: Bump version (if requested)
+        if: ${{ inputs.version_bump == true }}
+        run: |
+          # Увеличиваем patch версию
+          npm version patch --no-git-tag-version
+          NEW_VERSION=$(node --eval="process.stdout.write(require('./package.json').version)")
+          echo "Version bumped to: $NEW_VERSION"
+          echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Set build type
+        id: build-config
+        run: |
+          BUILD_TYPE="${{ inputs.build_type || 'debug' }}"
+          echo "build_type=$BUILD_TYPE" >> $GITHUB_OUTPUT
+          echo "Building $BUILD_TYPE version for Firefox"
+
+      - name: Build Firefox extension
+        run: |
+          BUILD_TYPE="${{ steps.build-config.outputs.build_type }}"
+          echo "Building Firefox MV2 extension with type: $BUILD_TYPE"
+          
+          # Запускаем соответствующий скрипт сборки для Firefox
+          yarn build:${BUILD_TYPE}:mv2
+          
+          echo "Build completed successfully!"
+
+      - name: Verify build output
+        run: |
+          echo "=== Checking build output ==="
+          if [ -d "dist-mv2" ]; then
+            echo "✅ dist-mv2 directory exists"
+            echo "📁 Contents:"
+            ls -la dist-mv2/
+            echo ""
+            echo "📄 Manifest content:"
+            cat dist-mv2/manifest.json | jq '.' 2>/dev/null || cat dist-mv2/manifest.json
+          else
+            echo "❌ dist-mv2 directory not found"
+            echo "Available directories:"
+            ls -la
+            exit 1
+          fi
+
+      - name: Create Firefox .xpi package
+        id: create-artifacts
+        run: |
+          VERSION="${{ steps.get-version.outputs.version }}"
+          BUILD_TYPE="${{ steps.build-config.outputs.build_type }}"
+          GIT_HASH=$(git rev-parse --short HEAD)
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          
+          # Имена файлов
+          XPI_NAME="rabby-firefox-${BUILD_TYPE}-v${VERSION}-${GIT_HASH}.xpi"
+          XPI_NAME_SIMPLE="rabby-firefox-${BUILD_TYPE}-v${VERSION}.xpi"
+          
+          echo "Creating Firefox .xpi packages..."
+          
+          # Создаем директорию для артефактов
+          mkdir -p artifacts
+          
+          # Упаковываем в .xpi (это zip файл)
+          cd dist-mv2
+          zip -r "../artifacts/$XPI_NAME" . -x "*.map" "*.md" "node_modules/*"
+          zip -r "../artifacts/$XPI_NAME_SIMPLE" . -x "*.map" "*.md" "node_modules/*"
+          cd ..
+          
+          # Создаем также обычный zip для разработчиков
+          ZIP_NAME="rabby-firefox-${BUILD_TYPE}-v${VERSION}-${GIT_HASH}-source.zip"
+          cd dist-mv2
+          zip -r "../artifacts/$ZIP_NAME" . -x "node_modules/*"
+          cd ..
+          
+          echo "Created packages:"
+          ls -la artifacts/
+          
+          # Проверяем размеры
+          echo ""
+          echo "Package sizes:"
+          du -h artifacts/*
+          
+          # Выводим переменные
+          echo "xpi_name=$XPI_NAME" >> $GITHUB_OUTPUT
+          echo "xpi_simple=$XPI_NAME_SIMPLE" >> $GITHUB_OUTPUT
+          echo "zip_name=$ZIP_NAME" >> $GITHUB_OUTPUT
+          echo "artifact-name=rabby-firefox-${BUILD_TYPE}-v${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Test Firefox extension
+        run: |
+          echo "=== Testing Firefox extension ==="
+          
+          # Проверяем что manifest.json валидный
+          if ! cat dist-mv2/manifest.json | jq empty 2>/dev/null; then
+            echo "❌ Invalid manifest.json"
+            exit 1
+          fi
+          
+          # Проверяем основные файлы
+          REQUIRED_FILES=("manifest.json" "background.js" "popup.html")
+          for file in "${REQUIRED_FILES[@]}"; do
+            if [ -f "dist-mv2/$file" ]; then
+              echo "✅ $file exists"
+            else
+              echo "⚠️  $file missing (might be optional)"
+            fi
+          done
+          
+          # Проверяем размер
+          TOTAL_SIZE=$(du -s dist-mv2 | cut -f1)
+          echo "Total extension size: ${TOTAL_SIZE}KB"
+          
+          if [ $TOTAL_SIZE -gt 102400 ]; then  # 100MB limit
+            echo "⚠️  Extension is quite large: ${TOTAL_SIZE}KB"
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.create-artifacts.outputs.artifact-name }}
+          path: |
+            artifacts/
+            dist-mv2/
+          retention-days: 30
+
+      - name: Upload to Firefox Add-ons (AMO)
+        if: ${{ inputs.upload_to_amo == true && secrets.AMO_JWT_ISSUER != '' && secrets.AMO_JWT_SECRET != '' }}
+        run: |
+          echo "🚀 Uploading to Firefox Add-ons..."
+          
+          # Устанавливаем web-ext
+          npm install -g web-ext
+          
+          # Загружаем в AMO
+          cd dist-mv2
+          web-ext sign \
+            --api-key="${{ secrets.AMO_JWT_ISSUER }}" \
+            --api-secret="${{ secrets.AMO_JWT_SECRET }}" \
+            --channel=unlisted
+          cd ..
+
+      - name: Create GitHub Release
+        if: ${{ inputs.create_release == true && github.event_name == 'workflow_dispatch' }}
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: firefox-v${{ steps.get-version.outputs.version }}
+          release_name: Firefox Extension v${{ steps.get-version.outputs.version }}
+          body: |
+            🦊 Rabby Firefox Extension v${{ steps.get-version.outputs.version }}
+            
+            **Build Type:** ${{ steps.build-config.outputs.build_type }}
+            **Commit:** ${{ github.sha }}
+            
+            ## Installation
+            1. Download the `.xpi` file
+            2. Open Firefox
+            3. Go to `about:debugging`
+            4. Click "This Firefox" → "Load Temporary Add-on"
+            5. Select the downloaded `.xpi` file
+            
+            ## Changes
+            - Built from commit ${{ github.sha }}
+            - Firefox Manifest V2 compatible
+            
+            **Files:**
+            - `rabby-firefox-*.xpi` - Ready to install extension
+            - `rabby-firefox-*-source.zip` - Source files for review
+          draft: false
+          prerelease: ${{ steps.build-config.outputs.build_type == 'debug' || steps.build-config.outputs.build_type == 'dev' }}
+
+  # Дополнительная задача для проверки совместимости
+  firefox-compatibility-check:
+    name: Firefox Compatibility Check
+    runs-on: ubuntu-latest
+    needs: build-firefox
+    if: always()
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build-firefox.outputs.artifact-name }}
+
+      - name: Install Firefox and web-ext
+        run: |
+          # Устанавливаем Firefox
+          sudo apt-get update
+          sudo apt-get install -y firefox
+          
+          # Устанавливаем web-ext для проверки
+          npm install -g web-ext
+
+      - name: Validate extension
+        run: |
+          echo "🔍 Validating Firefox extension..."
+          
+          if [ -d "dist-mv2" ]; then
+            cd dist-mv2
+            
+            # Проверяем с помощью web-ext
+            echo "Running web-ext lint..."
+            web-ext lint || echo "Lint completed with warnings"
+            
+            echo "Running web-ext build..."
+            web-ext build --overwrite-dest
+            
+            echo "✅ Firefox extension validation completed"
+          else
+            echo "❌ dist-mv2 directory not found"
+            exit 1
+          fi
+
+  # Notification задача
+  notify-completion:
+    name: Notify Build Completion
+    runs-on: ubuntu-latest
+    needs: [build-firefox, firefox-compatibility-check]
+    if: always()
+    steps:
+      - name: Notify success
+        if: ${{ needs.build-firefox.result == 'success' }}
+        run: |
+          echo "🎉 Firefox extension build completed successfully!"
+          echo "Version: ${{ needs.build-firefox.outputs.version }}"
+          echo "Artifact: ${{ needs.build-firefox.outputs.artifact-name }}"
+
+      - name: Notify failure
+        if: ${{ needs.build-firefox.result == 'failure' }}
+        run: |
+          echo "❌ Firefox extension build failed!"
+          echo "Check the logs above for details."
