@@ -70,7 +70,7 @@ jobs:
           cache: 'yarn'
 
       - name: Setup NPM Token
-        if: ${{ secrets.NPM_AUTH_TOKEN != '' }}
+        if: ${{ secrets.NPM_AUTH_TOKEN }}
         uses: heisenberg-2077/use-npm-token-action@v1
         with:
           token: '${{ secrets.NPM_AUTH_TOKEN }}'
@@ -210,8 +210,19 @@ jobs:
             dist-mv2/
           retention-days: 30
 
+      - name: Check AMO credentials
+        id: check-amo
+        if: ${{ inputs.upload_to_amo == true }}
+        run: |
+          if [ -n "${{ secrets.AMO_JWT_ISSUER }}" ] && [ -n "${{ secrets.AMO_JWT_SECRET }}" ]; then
+            echo "amo_ready=true" >> $GITHUB_OUTPUT
+          else
+            echo "amo_ready=false" >> $GITHUB_OUTPUT
+            echo "❌ AMO credentials not configured"
+          fi
+
       - name: Upload to Firefox Add-ons (AMO)
-        if: ${{ inputs.upload_to_amo == true && secrets.AMO_JWT_ISSUER != '' && secrets.AMO_JWT_SECRET != '' }}
+        if: ${{ steps.check-amo.outputs.amo_ready == 'true' }}
         run: |
           echo "🚀 Uploading to Firefox Add-ons..."
           
